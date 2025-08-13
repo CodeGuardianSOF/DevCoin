@@ -112,26 +112,6 @@ impl Blockchain {
         self.chain.push(block);
     }
 
-    fn apply_tx(&mut self, tx: &Transaction) -> Result<(), ChainError> {
-        match tx.tx_type {
-            TxType::Mint => {
-                // Only authority can mint; validated before adding block in this MVP
-                let to_bal = self.state.balances.entry(tx.to.clone()).or_default();
-                *to_bal = to_bal.saturating_add(tx.amount);
-                Ok(())
-            }
-            TxType::Transfer => {
-                let from = tx.from.clone().ok_or(ChainError::InvalidTx)?;
-                let from_bal = self.state.balances.entry(from.clone()).or_default();
-                if *from_bal < tx.amount { return Err(ChainError::InsufficientBalance); }
-                *from_bal -= tx.amount;
-                let to_bal = self.state.balances.entry(tx.to.clone()).or_default();
-                *to_bal = to_bal.saturating_add(tx.amount);
-                Ok(())
-            }
-        }
-    }
-
     pub fn add_block(&mut self, proposer: &str, txs: Vec<Transaction>) -> Result<&Block, ChainError> {
         if !self.authorities.contains(proposer) && proposer != "genesis" {
             return Err(ChainError::Unauthorized);
