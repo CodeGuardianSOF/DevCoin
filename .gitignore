@@ -416,3 +416,9 @@ FodyWeavers.xsd
 *.msix
 *.mst
 *.msp
+
+# Rust build
+target/
+
+# Custom directories
+.devcoin-data/
