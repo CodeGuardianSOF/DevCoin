@@ -59,4 +59,5 @@ fn e2e_health_mint_balance() {
     assert_eq!(bal["balance"].as_u64().unwrap_or(0), 5);
 
     let _ = child.kill();
+    let _ = child.wait();
 }

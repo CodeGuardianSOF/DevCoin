@@ -114,7 +114,7 @@ impl Blockchain {
                 };
                 bc.init_genesis();
                 // Best-effort save genesis
-                let _ = bc.save_snapshot(&bc.chain, &bc.state);
+                let _ = bc.save_snapshot(&bc.chain[..], &bc.state);
                 bc
             }
         }
@@ -149,10 +149,8 @@ impl Blockchain {
         let mut new_state = self.state.clone();
         for tx in &txs {
             // Validate mint authorization: for MVP, require tx.from to equal proposer for Mint
-            if matches!(tx.tx_type, TxType::Mint) {
-                if tx.from.as_deref() != Some(proposer) {
-                    return Err(ChainError::Unauthorized);
-                }
+            if matches!(tx.tx_type, TxType::Mint) && tx.from.as_deref() != Some(proposer) {
+                return Err(ChainError::Unauthorized);
             }
             // Apply into temp state
             match apply_tx_into(&mut new_state, tx) {
@@ -181,7 +179,7 @@ impl Blockchain {
         let mut new_chain = self.chain.clone();
         new_chain.push(block);
         // persist snapshot first
-        self.save_snapshot(&new_chain, &new_state)
+        self.save_snapshot(&new_chain[..], &new_state)
             .map_err(|e| ChainError::Storage(e.to_string()))?;
         // commit in-memory after successful persist
         self.state = new_state;
@@ -204,13 +202,12 @@ impl Blockchain {
         Ok(Some(snap))
     }
 
-    fn save_snapshot(&self, chain: &Vec<Block>, state: &ChainState) -> io::Result<()> {
+    fn save_snapshot(&self, chain: &[Block], state: &ChainState) -> io::Result<()> {
         let snap = Snapshot {
-            chain: chain.clone(),
+            chain: chain.to_owned(),
             state: state.clone(),
         };
-        let bytes = serde_json::to_vec_pretty(&snap)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let bytes = serde_json::to_vec_pretty(&snap).map_err(io::Error::other)?;
         let final_path = Self::snapshot_path(&self.data_dir);
         let tmp_path = final_path.with_extension("json.tmp");
         fs::write(&tmp_path, &bytes)?;
@@ -247,7 +244,7 @@ fn now_ts() -> u64 {
         .as_secs()
 }
 
-fn block_hash(header: &BlockHeader, txs: &Vec<Transaction>) -> String {
+fn block_hash(header: &BlockHeader, txs: &[Transaction]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(&header.prev_hash);
     hasher.update(header.timestamp.to_le_bytes());
@@ -334,18 +331,16 @@ fn init_tracing() {
 }
 
 fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
-    if let Some(v) = headers.get("Authorization") {
-        if let Ok(s) = v.to_str() {
-            let prefix = "Bearer ";
-            if let Some(rest) = s.strip_prefix(prefix) {
-                return Some(rest.trim().to_string());
-            }
-        }
+    if let Some(v) = headers.get("Authorization")
+        && let Ok(s) = v.to_str()
+        && let Some(rest) = s.strip_prefix("Bearer ")
+    {
+        return Some(rest.trim().to_string());
     }
-    if let Some(v) = headers.get("X-Devcoin-Token") {
-        if let Ok(s) = v.to_str() {
-            return Some(s.trim().to_string());
-        }
+    if let Some(v) = headers.get("X-Devcoin-Token")
+        && let Ok(s) = v.to_str()
+    {
+        return Some(s.trim().to_string());
     }
     None
 }
@@ -634,7 +629,7 @@ fn load_authority_keys() -> (HashMap<String, Ed25519PublicKey>, bool) {
         require_sigs = require,
         "authority key loading complete"
     );
-    (keys, require && added > 0 || require)
+    (keys, require)
 }
 
 fn parse_pubkey(s: &str) -> Option<Ed25519PublicKey> {
