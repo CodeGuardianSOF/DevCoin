@@ -21,84 +21,106 @@ import (
 )
 
 type Server struct {
-	addr         string
-	secrets      []string
-	apiBase      string
+	addr          string
+	secrets       []string
+	apiBase       string
 	repoWhitelist map[string]struct{}
-	httpServer   *http.Server
-	maintainers  map[string]struct{}
-	seen         map[string]struct{}
-	mu           sync.Mutex
-	nodeToken    string
-	proposer     string
-	privKey      ed25519.PrivateKey
-	signEnabled  bool
+	httpServer    *http.Server
+	maintainers   map[string]struct{}
+	seen          map[string]struct{}
+	mu            sync.Mutex
+	nodeToken     string
+	proposer      string
+	privKey       ed25519.PrivateKey
+	signEnabled   bool
 }
 
 type MintRequest struct {
-	Proposer string `json:"proposer"`
-	To       string `json:"to"`
-	Amount   uint64 `json:"amount"`
+	Proposer  string `json:"proposer"`
+	To        string `json:"to"`
+	Amount    uint64 `json:"amount"`
 	Signature string `json:"signature,omitempty"`
 	Nonce     uint64 `json:"nonce,omitempty"`
 }
 
 func New(addr, secret, api string, repos []string) (*Server, error) {
-	if secret == "" { return nil, errors.New("missing secret") }
+	if secret == "" {
+		return nil, errors.New("missing secret")
+	}
 	wl := map[string]struct{}{}
-	for _, r := range repos { if strings.TrimSpace(r) != "" { wl[strings.TrimSpace(r)] = struct{}{} } }
+	for _, r := range repos {
+		if strings.TrimSpace(r) != "" {
+			wl[strings.TrimSpace(r)] = struct{}{}
+		}
+	}
 	// Maintainers from env (comma-separated usernames)
 	maint := map[string]struct{}{}
 	if v := os.Getenv("MAINTAINERS"); v != "" {
 		for _, m := range strings.Split(v, ",") {
 			m = strings.TrimSpace(m)
-			if m != "" { maint[m] = struct{}{} }
+			if m != "" {
+				maint[m] = struct{}{}
+			}
 		}
 	}
 	r := gin.New()
 	r.Use(gin.Recovery())
 	// Allow multiple secrets for rotation (comma-separated)
 	secrets := splitList(secret)
-	if len(secrets) == 0 { secrets = []string{secret} }
+	if len(secrets) == 0 {
+		secrets = []string{secret}
+	}
 	nodeToken := os.Getenv("ORACLE_NODE_TOKEN")
 	proposer := os.Getenv("ORACLE_PROPOSER")
-	if proposer == "" { proposer = "authority1" }
+	if proposer == "" {
+		proposer = "authority1"
+	}
 	// Optional Ed25519 signing
 	var pk ed25519.PrivateKey
 	var sign bool
 	if v := os.Getenv("ORACLE_ED25519_PRIVKEY"); v != "" {
-		if k, err := parsePrivKey(v); err == nil { pk = k; sign = true }
+		if k, err := parsePrivKey(v); err == nil {
+			pk = k
+			sign = true
+		}
 	}
 	if !sign {
 		if path := os.Getenv("ORACLE_ED25519_PRIVKEY_FILE"); path != "" {
 			if b, err := os.ReadFile(path); err == nil {
-				if k, err2 := parsePrivKey(strings.TrimSpace(string(b))); err2 == nil { pk = k; sign = true }
+				if k, err2 := parsePrivKey(strings.TrimSpace(string(b))); err2 == nil {
+					pk = k
+					sign = true
+				}
 			}
 		}
 	}
-	s := &Server{addr: addr, secrets: secrets, apiBase: strings.TrimRight(api, "/"), repoWhitelist: wl, maintainers: maint, seen: map[string]struct{}{}, nodeToken: nodeToken, proposer: proposer, privKey: pk, signEnabled: sign }
+	s := &Server{addr: addr, secrets: secrets, apiBase: strings.TrimRight(api, "/"), repoWhitelist: wl, maintainers: maint, seen: map[string]struct{}{}, nodeToken: nodeToken, proposer: proposer, privKey: pk, signEnabled: sign}
 	r.POST("/webhook", s.handleWebhook)
-	r.GET("/healthz", func(c *gin.Context){ c.String(200, "ok") })
-	s.httpServer = &http.Server{ Addr: addr, Handler: r }
+	r.GET("/healthz", func(c *gin.Context) { c.String(200, "ok") })
+	s.httpServer = &http.Server{Addr: addr, Handler: r}
 	return s, nil
 }
 
-func (s *Server) Start() error {
-	return s.httpServer.ListenAndServe()
-}
+func (s *Server) Start() error { return s.httpServer.ListenAndServe() }
 
 func (s *Server) verifySignature(sigHeader string, body []byte) bool {
 	// GitHub signatures: sha256=hex
 	const prefix = "sha256="
-	if !strings.HasPrefix(sigHeader, prefix) { return false }
+	if !strings.HasPrefix(sigHeader, prefix) {
+		return false
+	}
 	hexSig := strings.TrimPrefix(sigHeader, prefix)
 	got, err := hex.DecodeString(hexSig)
-	if err != nil { return false }
+	if err != nil {
+		return false
+	}
 	for _, sec := range s.secrets {
 		mac := hmac.New(sha256.New, []byte(strings.TrimSpace(sec)))
 		mac.Write(body)
 		exp := mac.Sum(nil)
-		if hmac.Equal(exp, got) { return true }
+		if hmac.Equal(exp, got) {
+			return true
+		}
 	}
 	return false
 }
@@ -107,21 +129,35 @@ func (s *Server) handleWebhook(c *gin.Context) {
 	// Verify signature
 	sig := c.GetHeader("X-Hub-Signature-256")
 	payload, err := io.ReadAll(c.Request.Body)
-	if err != nil { c.String(http.StatusBadRequest, "read error"); return }
-	if !s.verifySignature(sig, payload) { c.String(http.StatusUnauthorized, "bad signature"); return }
+	if err != nil {
+		c.String(http.StatusBadRequest, "read error")
+		return
+	}
+	if !s.verifySignature(sig, payload) {
+		c.String(http.StatusUnauthorized, "bad signature")
+		return
+	}
 
 	// Parse event type and payload minimally
 	event := c.GetHeader("X-GitHub-Event")
 	var obj map[string]any
-	if err := json.Unmarshal(payload, &obj); err != nil { c.String(http.StatusBadRequest, "json error"); return }
+	if err := json.Unmarshal(payload, &obj); err != nil {
+		c.String(http.StatusBadRequest, "json error")
+		return
+	}
 
 	// Determine repository full_name
 	repoFull := ""
 	if repo, ok := obj["repository"].(map[string]any); ok {
-		if fn, ok := repo["full_name"].(string); ok { repoFull = fn }
+		if fn, ok := repo["full_name"].(string); ok {
+			repoFull = fn
+		}
 	}
 	if len(s.repoWhitelist) > 0 {
-		if _, ok := s.repoWhitelist[repoFull]; !ok { c.String(http.StatusOK, "ignored repo"); return }
+		if _, ok := s.repoWhitelist[repoFull]; !ok {
+			c.String(http.StatusOK, "ignored repo")
+			return
+		}
 	}
 
 	// Delegate to actions engine
@@ -130,16 +166,17 @@ func (s *Server) handleWebhook(c *gin.Context) {
 }
 
 // Helpers used by actions.go
-func (s *Server) isMaintainer(user string) bool {
-	_, ok := s.maintainers[user]
-	return ok
-}
+func (s *Server) isMaintainer(user string) bool { _, ok := s.maintainers[user]; return ok }
 
 func (s *Server) markSeen(key string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, exists := s.seen[key]; exists { return false }
-	if len(s.seen) > 5000 { s.seen = map[string]struct{}{} }
+	if _, exists := s.seen[key]; exists {
+		return false
+	}
+	if len(s.seen) > 5000 {
+		s.seen = map[string]struct{}{}
+	}
 	s.seen[key] = struct{}{}
 	return true
 }
@@ -147,7 +184,7 @@ func (s *Server) markSeen(key string) bool {
 func (s *Server) mintFor(githubUser string, amount uint64) error {
 	// Wallet mapping MVP: username->same string; in real world resolve to wallet address
 	addr := githubUser
-	mr := MintRequest{ Proposer: s.proposer, To: addr, Amount: amount }
+	mr := MintRequest{Proposer: s.proposer, To: addr, Amount: amount}
 	if s.signEnabled {
 		// nonce for replay protection
 		mr.Nonce = uint64(time.Now().UnixNano())
@@ -163,13 +200,17 @@ func (s *Server) mintFor(githubUser string, amount uint64) error {
 	client.RetryMax = 4
 
 	req, err := retryablehttp.NewRequest(http.MethodPost, s.apiBase+"/mint", b)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	req.Header.Set("Content-Type", "application/json")
 	if s.nodeToken != "" {
 		req.Header.Set("Authorization", "Bearer "+s.nodeToken)
 	}
 	resp, err := client.Do(req)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(resp.Body)
@@ -184,7 +225,9 @@ func splitList(s string) []string {
 	out := make([]string, 0, len(parts))
 	for _, p := range parts {
 		p = strings.TrimSpace(p)
-		if p != "" { out = append(out, p) }
+		if p != "" {
+			out = append(out, p)
+		}
 	}
 	return out
 }

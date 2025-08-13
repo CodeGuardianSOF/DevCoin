@@ -1,10 +1,12 @@
+use std::net::TcpListener;
 use std::process::{Command, Stdio};
 use std::{thread, time::Duration};
-use std::net::{TcpListener};
 
 fn wait_port(addr: &str, attempts: u32) {
     for _ in 0..attempts {
-        if std::net::TcpStream::connect(addr).is_ok() { return; }
+        if std::net::TcpStream::connect(addr).is_ok() {
+            return;
+        }
         thread::sleep(Duration::from_millis(100));
     }
     panic!("port not listening: {}", addr);
@@ -34,7 +36,9 @@ fn e2e_health_mint_balance() {
     wait_port(&addr, 300); // up to ~30s
 
     // health
-    let health = ureq::get(&format!("http://{}/health", addr)).call().unwrap();
+    let health = ureq::get(&format!("http://{}/health", addr))
+        .call()
+        .unwrap();
     assert_eq!(health.status(), 200);
 
     // mint
@@ -47,7 +51,11 @@ fn e2e_health_mint_balance() {
     assert_eq!(mint.status(), 200, "mint status: {}", mint.status());
 
     // balance
-    let bal: serde_json::Value = ureq::get(&format!("http://{}/balance/{}", addr, "itest")).call().unwrap().into_json().unwrap();
+    let bal: serde_json::Value = ureq::get(&format!("http://{}/balance/{}", addr, "itest"))
+        .call()
+        .unwrap()
+        .into_json()
+        .unwrap();
     assert_eq!(bal["balance"].as_u64().unwrap_or(0), 5);
 
     let _ = child.kill();
