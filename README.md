@@ -32,6 +32,7 @@ README.md           # This file
   - REST API: health, mint, transfer, balance, chain
   - Persistence: atomically writes `snapshot.json` to a data dir on each new block
   - Optional bearer token required for `/mint` via `DEVCOIN_MINT_TOKEN`
+  - Optional Ed25519 signatures for `/mint` and `/transfer` with per-authority public keys and replay protection
 
 - Contribution Oracle (Go)
 
@@ -67,14 +68,14 @@ export DEVCOIN_MINT_TOKEN="super-secret-token"
 cargo run --manifest-path src/blockchain-node/Cargo.toml
 ```
 
-Node listens on http://127.0.0.1:8080.
+Node listens on <http://127.0.0.1:8080>.
 
 1. Run the Oracle (Go)
 
 ```bash
 export GITHUB_WEBHOOK_SECRET="my-secret,rotating-secret"   # supports comma-separated secrets
 export REPO_WHITELIST="owner/repo"                         # comma-separated full names
-export BLOCKCHAIN_API="http://127.0.0.1:8080"              # node base URL
+export BLOCKCHAIN_API="<http://127.0.0.1:8080>"              # node base URL
 export ORACLE_NODE_TOKEN="super-secret-token"              # must match DEVCOIN_MINT_TOKEN
 export ORACLE_PROPOSER="authority1"                        # proposer must be in DEVCOIN_AUTHORITIES
 export MAINTAINERS="alice,bob"                             # optional, for push filtering
@@ -95,7 +96,7 @@ npm install
 npm run dev
 ```
 
-Open http://127.0.0.1:5173/ and paste your token into the “API Token (for /mint)” field when minting.
+Open <http://127.0.0.1:5173/> and paste your token into the “API Token (for /mint)” field when minting.
 
 ---
 
@@ -106,12 +107,17 @@ Environment
 - `DEVCOIN_AUTHORITIES` — comma‑separated authority IDs (default: `authority1`)
 - `DEVCOIN_DATA_DIR` — directory for persistence (default: `src/blockchain-node/data`)
 - `DEVCOIN_MINT_TOKEN` — if set, `/mint` requires token via `Authorization: Bearer <token>` or `X-Devcoin-Token: <token>`
+- `DEVCOIN_ADDR` — bind address (default `127.0.0.1:8080`)
+- `DEVCOIN_AUTHORITIES_FILE` — path to file with one authority ID per line (merged with `DEVCOIN_AUTHORITIES`)
+- `DEVCOIN_REQUIRE_AUTHORITIES` — set to `1/true` to require explicit authorities (panic if none configured)
+- `DEVCOIN_AUTHORITIES_KEYS` — path to file mapping `authorityID=<base64 or hex ed25519 public key>` per line
+- `DEVCOIN_REQUIRE_SIGS` — set to `1/true` to require Ed25519 signatures for privileged endpoints
 
 API
 
 - `GET /health` → "ok"
-- `POST /mint` `{ proposer, to, amount }`
-- `POST /transfer` `{ proposer, from, to, amount }`
+- `POST /mint` `{ proposer, to, amount, signature?, nonce? }`
+- `POST /transfer` `{ proposer, from, to, amount, signature?, nonce? }`
 - `GET /balance/:user` → `{ user, balance }`
 - `GET /chain` → full chain JSON
 
@@ -119,8 +125,8 @@ Consensus and Rules (MVP)
 
 - PoA: proposer must be listed in `DEVCOIN_AUTHORITIES`.
 - Mint: requires `tx.from == proposer` and proposer is an authority.
-- Transfer: no signatures yet; proposer must be an authority; `from` balance is debited.
-- Signatures/keys are not implemented in the MVP.
+- Transfer: proposer must be an authority; `from` balance is debited.
+- Optional signatures: when `DEVCOIN_REQUIRE_SIGS=true`, requests must carry a valid Ed25519 `signature` over a canonical message and a `nonce` to prevent replay.
 
 Persistence
 
@@ -135,11 +141,13 @@ Environment
 
 - `GITHUB_WEBHOOK_SECRET` — HMAC secret(s); supports multiple values (comma‑separated) for rotation
 - `REPO_WHITELIST` — comma‑separated `owner/repo` full names to accept; others ignored
-- `BLOCKCHAIN_API` — node base URL (e.g., `http://127.0.0.1:8080`)
+- `BLOCKCHAIN_API` — node base URL (e.g., `<http://127.0.0.1:8080>`)
 - `ORACLE_NODE_TOKEN` — bearer token sent to node `/mint` (must match node’s `DEVCOIN_MINT_TOKEN`)
 - `ORACLE_PROPOSER` — proposer ID (must be authorized on node; default `authority1`)
 - `MAINTAINERS` — usernames treated as maintainers (filters push rewards)
 - `ORACLE_ADDR` — bind address (default `:8090`)
+- `ORACLE_ED25519_PRIVKEY` — base64/hex-encoded Ed25519 private key (32-byte seed or 64-byte private key)
+- `ORACLE_ED25519_PRIVKEY_FILE` — path to file containing the private key (alternative to env var)
 
 Endpoints
 
@@ -175,7 +183,7 @@ npm run dev
 
 Notes
 
-- Dev server proxies `/api/*` to the node URL (default `http://127.0.0.1:8080`; override with `VITE_NODE_URL`).
+- Dev server proxies `/api/*` to the node URL (default `<http://127.0.0.1:8080>`; override with `VITE_NODE_URL`).
 - Paste your `DEVCOIN_MINT_TOKEN` into the UI to authorize mint operations.
 
 ---
@@ -189,6 +197,37 @@ Notes
 
 ---
 
+## Ed25519 authority keys and signatures
+
+Enable public-key verification on the node and signing in the oracle.
+
+1. Configure node public keys
+
+- Create a file, e.g. `keys.txt`, with lines:
+  - `authority1=<base64 or hex ed25519 public key>`
+- Start node with:
+  - `DEVCOIN_AUTHORITIES="authority1"`
+  - `DEVCOIN_AUTHORITIES_KEYS=keys.txt`
+  - `DEVCOIN_REQUIRE_SIGS=true` (to enforce)
+
+1. Configure oracle to sign
+
+- Provide `ORACLE_ED25519_PRIVKEY` (base64/hex) or `ORACLE_ED25519_PRIVKEY_FILE` with the private key.
+- The oracle will attach `signature` (base64) and a `nonce` to `/mint`.
+
+1. Message formats
+
+- Mint: `mint|<proposer>|<to>|<amount>|<nonce>`
+- Transfer: `transfer|<proposer>|<from>|<to>|<amount>|<nonce>`
+
+1. Replay protection
+
+- The node tracks nonces per authority and rejects repeats. Use unique, time-based nonces.
+
+Signatures are optional by default; enforcement occurs only when `DEVCOIN_REQUIRE_SIGS=true`.
+
+---
+
 ## Roadmap
 
 - Shared token on `/transfer`, multi‑secret rotation for node API
@@ -196,6 +235,7 @@ Notes
 - Wallet mapping service (GitHub user → wallet address)
 - Docker/Compose, CI, richer tests
 - Append‑only block log and stronger durability
+- CLI helper to generate and print ed25519 keys (base64/hex)
 
 ---
 

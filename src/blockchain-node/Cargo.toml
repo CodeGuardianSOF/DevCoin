@@ -1,8 +1,8 @@
 [package]
 name = "devcoin-node"
-version = "0.1.0"
-edition = "2021"
-license = "MIT OR Apache-2.0"
+version = "1.0.0"
+edition = "2024"
+license = "MIT"
 authors = ["DevCoin Contributors"]
 description = "DevCoin blockchain node (MVP) with simple PoA consensus and REST API"
 
@@ -17,3 +17,10 @@ thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 once_cell = "1"
+ed25519-dalek = "1"
+base64 = "0.21"
+
+[dev-dependencies]
+ureq = { version = "2", features = ["json"] }
+tempfile = "3"
+rand = "0.8"

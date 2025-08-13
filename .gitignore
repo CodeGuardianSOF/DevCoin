@@ -420,5 +420,10 @@ FodyWeavers.xsd
 # Rust build
 target/
 
-# Custom directories
+# Custom directories/files
 .devcoin-data/
+.pids/
+.Tests.md
+bin/
+keys.txt
+*secrets*/

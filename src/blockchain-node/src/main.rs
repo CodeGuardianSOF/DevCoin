@@ -1,4 +1,4 @@
-use std::{collections::HashMap, env, fs, io, net::SocketAddr, path::{Path, PathBuf}, sync::Arc, time::{SystemTime, UNIX_EPOCH}};
+use std::{collections::{HashMap, HashSet}, env, fs, io, net::SocketAddr, path::{Path, PathBuf}, sync::Arc, time::{SystemTime, UNIX_EPOCH}};
 
 use axum::{routing::{get, post}, Json, Router, extract::State};
 use axum::http::HeaderMap;
@@ -10,6 +10,10 @@ use thiserror::Error;
 use tokio::{net::TcpListener, sync::RwLock};
 use tracing::{info, Level};
 use tracing_subscriber::EnvFilter;
+use ed25519_dalek::{PublicKey as Ed25519PublicKey, Signature as Ed25519Signature, Verifier};
+use base64::Engine as _;
+
+fn b64_decode(input: &str) -> Result<Vec<u8>, base64::DecodeError> { base64::engine::general_purpose::STANDARD.decode(input) }
 
 static GENESIS_PREV_HASH: Lazy<String> = Lazy::new(|| "0".repeat(64));
 
@@ -59,7 +63,7 @@ struct Snapshot {
 pub struct Blockchain {
     pub chain: Vec<Block>,
     pub state: ChainState,
-    pub authorities: Vec<String>,
+    pub authorities: HashSet<String>,
     data_dir: PathBuf,
 }
 
@@ -76,7 +80,7 @@ pub enum ChainError {
 }
 
 impl Blockchain {
-    pub fn new(authorities: Vec<String>, data_dir: impl Into<PathBuf>) -> Self {
+    pub fn new(authorities: HashSet<String>, data_dir: impl Into<PathBuf>) -> Self {
         let data_dir = data_dir.into();
         if let Err(e) = fs::create_dir_all(&data_dir) {
             tracing::warn!(error = %e, "failed to create data dir, proceeding");
@@ -129,7 +133,7 @@ impl Blockchain {
     }
 
     pub fn add_block(&mut self, proposer: &str, txs: Vec<Transaction>) -> Result<&Block, ChainError> {
-        if !self.authorities.iter().any(|a| a == proposer) && proposer != "genesis" {
+        if !self.authorities.contains(proposer) && proposer != "genesis" {
             return Err(ChainError::Unauthorized);
         }
         // Clone state for atomicity; on error, state not changed
@@ -224,13 +228,16 @@ fn block_hash(header: &BlockHeader, txs: &Vec<Transaction>) -> String {
 struct AppState {
     chain: Arc<RwLock<Blockchain>>,
     mint_token: Option<String>,
+    authority_keys: HashMap<String, Ed25519PublicKey>,
+    require_sigs: bool,
+    seen_nonces: Arc<RwLock<HashSet<String>>>,
 }
 
 #[derive(Debug, Deserialize)]
-struct MintRequest { proposer: String, to: String, amount: u64 }
+struct MintRequest { proposer: String, to: String, amount: u64, signature: Option<String>, nonce: Option<u64> }
 
 #[derive(Debug, Deserialize)]
-struct TransferRequest { proposer: String, from: String, to: String, amount: u64 }
+struct TransferRequest { proposer: String, from: String, to: String, amount: u64, signature: Option<String>, nonce: Option<u64> }
 
 #[tokio::main]
 async fn main() {
@@ -238,7 +245,22 @@ async fn main() {
     let authorities = load_authorities();
     let data_dir = env::var("DEVCOIN_DATA_DIR").unwrap_or_else(|_| "src/blockchain-node/data".to_string());
     let mint_token = env::var("DEVCOIN_MINT_TOKEN").ok();
-    let state = AppState { chain: Arc::new(RwLock::new(Blockchain::new(authorities, data_dir))), mint_token };
+    let (authority_keys, require_sigs) = load_authority_keys();
+    // Startup diagnostics
+    info!(
+        authorities = ?authorities,
+        keys_loaded = authority_keys.len(),
+        key_ids = ?authority_keys.keys().cloned().collect::<Vec<_>>(),
+        require_sigs = require_sigs,
+        "DevCoin node configuration loaded"
+    );
+    let state = AppState {
+        chain: Arc::new(RwLock::new(Blockchain::new(authorities, data_dir))),
+        mint_token,
+        authority_keys,
+        require_sigs,
+        seen_nonces: Arc::new(RwLock::new(HashSet::new())),
+    };
 
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
@@ -248,7 +270,8 @@ async fn main() {
         .route("/chain", get(get_chain))
         .with_state(state);
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], 8080));
+    let addr_str = env::var("DEVCOIN_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
+    let addr: SocketAddr = addr_str.parse().expect("invalid DEVCOIN_ADDR");
     let listener = TcpListener::bind(addr).await.unwrap();
     info!("Listening on {}", listener.local_addr().unwrap());
     axum::serve(listener, app).await.unwrap();
@@ -283,6 +306,58 @@ async fn mint(State(state): State<AppState>, headers: HeaderMap, Json(req): Json
             return Json(json!({"status":"error","message":"unauthorized"}));
         }
     }
+    // Optional signature verification
+    let key_opt = state.authority_keys.get(&req.proposer);
+    // Request diagnostics (info level, minimal data)
+    info!(
+        proposer = %req.proposer,
+        have_key = key_opt.is_some(),
+        require_sigs = state.require_sigs,
+        have_sig = req.signature.as_ref().map(|_| true).unwrap_or(false),
+        nonce = req.nonce.unwrap_or(0),
+        "mint request received"
+    );
+    let sig_opt = req.signature.as_ref();
+    if state.require_sigs {
+        let Some(key) = key_opt else { return Json(json!({"status":"error","message":"unknown authority"})); };
+        let Some(sig_b64) = sig_opt else { return Json(json!({"status":"error","message":"missing signature"})); };
+        let nonce = req.nonce.unwrap_or(0);
+        let msg = format!("mint|{}|{}|{}|{}", req.proposer, req.to, req.amount, nonce);
+        match b64_decode(sig_b64)
+            .ok()
+            .and_then(|b| Ed25519Signature::from_bytes(&b).ok())
+            .and_then(|sig| key.verify(msg.as_bytes(), &sig).ok()) {
+            Some(()) => {
+                let dedup_key = format!("{}:{}", req.proposer, nonce);
+                let mut seen = state.seen_nonces.write().await;
+                if nonce != 0 {
+                    if seen.contains(&dedup_key) { return Json(json!({"status":"error","message":"replay"})); }
+                    if seen.len() > 10_000 { seen.clear(); }
+                    seen.insert(dedup_key);
+                }
+            }
+            None => return Json(json!({"status":"error","message":"bad signature"})),
+        }
+    } else if let (Some(key), Some(sig_b64)) = (key_opt, sig_opt) {
+        let nonce = req.nonce.unwrap_or(0);
+        let msg = format!("mint|{}|{}|{}|{}", req.proposer, req.to, req.amount, nonce);
+        if b64_decode(sig_b64)
+            .ok()
+            .and_then(|b| Ed25519Signature::from_bytes(&b).ok())
+            .and_then(|sig| key.verify(msg.as_bytes(), &sig).ok())
+            .is_some()
+        {
+            let dedup_key = format!("{}:{}", req.proposer, nonce);
+            let mut seen = state.seen_nonces.write().await;
+            if nonce != 0 {
+                if seen.contains(&dedup_key) { return Json(json!({"status":"error","message":"replay"})); }
+                if seen.len() > 10_000 { seen.clear(); }
+                seen.insert(dedup_key);
+            }
+        } else {
+            return Json(json!({"status":"error","message":"bad signature"}));
+        }
+    }
     let tx = Transaction { tx_type: TxType::Mint, from: Some(req.proposer.clone()), to: req.to, amount: req.amount, signature: None };
     let mut chain = state.chain.write().await;
     let res = chain.add_block(&req.proposer, vec![tx]);
@@ -293,6 +368,48 @@ async fn mint(State(state): State<AppState>, headers: HeaderMap, Json(req): Json
 }
 
 async fn transfer(State(state): State<AppState>, Json(req): Json<TransferRequest>) -> Json<serde_json::Value> {
+    let key_opt = state.authority_keys.get(&req.proposer);
+    let sig_opt = req.signature.as_ref();
+    if state.require_sigs {
+        let Some(key) = key_opt else { return Json(json!({"status":"error","message":"unknown authority"})); };
+        let Some(sig_b64) = sig_opt else { return Json(json!({"status":"error","message":"missing signature"})); };
+        let nonce = req.nonce.unwrap_or(0);
+        let msg = format!("transfer|{}|{}|{}|{}|{}", req.proposer, req.from, req.to, req.amount, nonce);
+        match b64_decode(sig_b64)
+            .ok()
+            .and_then(|b| Ed25519Signature::from_bytes(&b).ok())
+            .and_then(|sig| key.verify(msg.as_bytes(), &sig).ok()) {
+            Some(()) => {
+                let dedup_key = format!("{}:{}", req.proposer, nonce);
+                let mut seen = state.seen_nonces.write().await;
+                if nonce != 0 {
+                    if seen.contains(&dedup_key) { return Json(json!({"status":"error","message":"replay"})); }
+                    if seen.len() > 10_000 { seen.clear(); }
+                    seen.insert(dedup_key);
+                }
+            }
+            None => return Json(json!({"status":"error","message":"bad signature"})),
+        }
+    } else if let (Some(key), Some(sig_b64)) = (key_opt, sig_opt) {
+        let nonce = req.nonce.unwrap_or(0);
+        let msg = format!("transfer|{}|{}|{}|{}|{}", req.proposer, req.from, req.to, req.amount, nonce);
+        if b64_decode(sig_b64)
+            .ok()
+            .and_then(|b| Ed25519Signature::from_bytes(&b).ok())
+            .and_then(|sig| key.verify(msg.as_bytes(), &sig).ok())
+            .is_some()
+        {
+            let dedup_key = format!("{}:{}", req.proposer, nonce);
+            let mut seen = state.seen_nonces.write().await;
+            if nonce != 0 {
+                if seen.contains(&dedup_key) { return Json(json!({"status":"error","message":"replay"})); }
+                if seen.len() > 10_000 { seen.clear(); }
+                seen.insert(dedup_key);
+            }
+        } else {
+            return Json(json!({"status":"error","message":"bad signature"}));
+        }
+    }
     let tx = Transaction { tx_type: TxType::Transfer, from: Some(req.from), to: req.to, amount: req.amount, signature: None };
     let mut chain = state.chain.write().await;
     let res = chain.add_block(&req.proposer, vec![tx]);
@@ -313,26 +430,110 @@ async fn get_chain(State(state): State<AppState>) -> Json<Vec<Block>> {
     Json(chain.chain.clone())
 }
 
-fn load_authorities() -> Vec<String> {
-    match env::var("DEVCOIN_AUTHORITIES") {
-        Ok(val) => val
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>(),
-        Err(_) => vec!["authority1".to_string()],
+fn load_authorities() -> HashSet<String> {
+    // Prefer file if provided
+    let file_path = env::var("DEVCOIN_AUTHORITIES_FILE").ok();
+    let mut set: HashSet<String> = HashSet::new();
+    if let Some(fp) = file_path {
+        if let Ok(data) = fs::read_to_string(fp) {
+            for line in data.lines() {
+                let v = line.trim();
+                if !v.is_empty() { set.insert(v.to_string()); }
+            }
+        }
     }
+    // Merge from env list
+    if let Ok(val) = env::var("DEVCOIN_AUTHORITIES") {
+        for v in val.split(',') {
+            let v = v.trim();
+            if !v.is_empty() { set.insert(v.to_string()); }
+        }
+    }
+    // In production, require explicit authorities to avoid insecure defaults
+    let require = env::var("DEVCOIN_REQUIRE_AUTHORITIES").map(|v| {
+        matches!(v.to_ascii_lowercase().as_str(), "1"|"true"|"yes")
+    }).unwrap_or(false) || matches!(env::var("RUST_ENV").ok().as_deref(), Some("production"))
+      || matches!(env::var("NODE_ENV").ok().as_deref(), Some("production"));
+    if set.is_empty() {
+        if require {
+            panic!("No authorities configured: set DEVCOIN_AUTHORITIES or DEVCOIN_AUTHORITIES_FILE");
+        } else {
+            // Dev-friendly default
+            set.insert("authority1".to_string());
+        }
+    }
+    set
+}
+
+fn load_authority_keys() -> (HashMap<String, Ed25519PublicKey>, bool) {
+    let mut keys: HashMap<String, Ed25519PublicKey> = HashMap::new();
+    let mut added = 0usize;
+    if let Ok(path) = env::var("DEVCOIN_AUTHORITIES_KEYS") {
+        if let Ok(contents) = fs::read_to_string(&path) {
+            for line in contents.lines() {
+                // drop inline comments and trim
+                let mut line = line;
+                if let Some((head, _)) = line.split_once('#') { line = head; }
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') { continue; }
+                // Split on the FIRST separator only to preserve base64 '=' padding
+                let (id, key_str_opt): (String, Option<&str>) = if let Some((a, b)) = line.split_once('=') {
+                    (a.trim().to_string(), Some(b.trim()))
+                } else if let Some((a, b)) = line.split_once(':') {
+                    (a.trim().to_string(), Some(b.trim()))
+                } else {
+                    // Fallback: split on whitespace into two parts
+                    let mut it = line.split_whitespace();
+                    let a = it.next().unwrap_or("").trim().to_string();
+                    let b = it.next();
+                    (a, b)
+                };
+                let Some(key_str) = key_str_opt else {
+                    tracing::warn!(file = %path, line = %line, "missing key value in authority keys line");
+                    continue;
+                };
+                if id.is_empty() { tracing::warn!(file = %path, line = %line, "empty authority id"); continue; }
+                if let Some(pk) = parse_pubkey(key_str) {
+                    keys.insert(id.clone(), pk);
+                    added += 1;
+                    info!(file = %path, authority = %id, "loaded authority public key");
+                } else {
+                    tracing::warn!(file = %path, line = %line, "failed to parse authority public key");
+                }
+            }
+        } else {
+            tracing::warn!(file = %path, "failed to read DEVCOIN_AUTHORITIES_KEYS file");
+        }
+    }
+    let require = env::var("DEVCOIN_REQUIRE_SIGS").map(|v| matches!(v.to_ascii_lowercase().as_str(), "1"|"true"|"yes" )).unwrap_or(false);
+    info!(keys = added, require_sigs = require, "authority key loading complete");
+    (keys, require && added>0 || require)
+}
+
+fn parse_pubkey(s: &str) -> Option<Ed25519PublicKey> {
+    // Try base64, then hex
+    if let Ok(b) = b64_decode(s) {
+        if b.len() != 32 {
+            tracing::warn!(len = b.len(), "decoded base64 pubkey has unexpected length");
+        }
+        return Ed25519PublicKey::from_bytes(&b).ok();
+    }
+    if let Ok(b) = hex::decode(s) {
+        if b.len() != 32 {
+            tracing::warn!(len = b.len(), "decoded hex pubkey has unexpected length");
+        }
+        return Ed25519PublicKey::from_bytes(&b).ok();
+    }
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use std::path::PathBuf;
-
     #[test]
     fn test_mint_and_transfer() {
-        let authorities = vec!["authority1".to_string()];
+    let authorities: HashSet<String> = ["authority1".to_string()].into_iter().collect();
         let mut tmp = std::env::temp_dir();
         tmp.push(format!("devcoin_test_{}", now_ts()));
         let mut chain = Blockchain::new(authorities, tmp);

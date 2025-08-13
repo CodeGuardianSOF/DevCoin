@@ -1,8 +1,10 @@
 package server
 
 import (
+	"crypto/ed25519"
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -29,12 +31,16 @@ type Server struct {
 	mu           sync.Mutex
 	nodeToken    string
 	proposer     string
+	privKey      ed25519.PrivateKey
+	signEnabled  bool
 }
 
 type MintRequest struct {
 	Proposer string `json:"proposer"`
 	To       string `json:"to"`
 	Amount   uint64 `json:"amount"`
+	Signature string `json:"signature,omitempty"`
+	Nonce     uint64 `json:"nonce,omitempty"`
 }
 
 func New(addr, secret, api string, repos []string) (*Server, error) {
@@ -57,7 +63,20 @@ func New(addr, secret, api string, repos []string) (*Server, error) {
 	nodeToken := os.Getenv("ORACLE_NODE_TOKEN")
 	proposer := os.Getenv("ORACLE_PROPOSER")
 	if proposer == "" { proposer = "authority1" }
-	s := &Server{addr: addr, secrets: secrets, apiBase: strings.TrimRight(api, "/"), repoWhitelist: wl, maintainers: maint, seen: map[string]struct{}{}, nodeToken: nodeToken, proposer: proposer }
+	// Optional Ed25519 signing
+	var pk ed25519.PrivateKey
+	var sign bool
+	if v := os.Getenv("ORACLE_ED25519_PRIVKEY"); v != "" {
+		if k, err := parsePrivKey(v); err == nil { pk = k; sign = true }
+	}
+	if !sign {
+		if path := os.Getenv("ORACLE_ED25519_PRIVKEY_FILE"); path != "" {
+			if b, err := os.ReadFile(path); err == nil {
+				if k, err2 := parsePrivKey(strings.TrimSpace(string(b))); err2 == nil { pk = k; sign = true }
+			}
+		}
+	}
+	s := &Server{addr: addr, secrets: secrets, apiBase: strings.TrimRight(api, "/"), repoWhitelist: wl, maintainers: maint, seen: map[string]struct{}{}, nodeToken: nodeToken, proposer: proposer, privKey: pk, signEnabled: sign }
 	r.POST("/webhook", s.handleWebhook)
 	r.GET("/healthz", func(c *gin.Context){ c.String(200, "ok") })
 	s.httpServer = &http.Server{ Addr: addr, Handler: r }
@@ -129,6 +148,13 @@ func (s *Server) mintFor(githubUser string, amount uint64) error {
 	// Wallet mapping MVP: username->same string; in real world resolve to wallet address
 	addr := githubUser
 	mr := MintRequest{ Proposer: s.proposer, To: addr, Amount: amount }
+	if s.signEnabled {
+		// nonce for replay protection
+		mr.Nonce = uint64(time.Now().UnixNano())
+		msg := fmt.Sprintf("mint|%s|%s|%d|%d", mr.Proposer, mr.To, mr.Amount, mr.Nonce)
+		sig := ed25519.Sign(s.privKey, []byte(msg))
+		mr.Signature = base64.StdEncoding.EncodeToString(sig)
+	}
 	b, _ := json.Marshal(mr)
 
 	client := retryablehttp.NewClient()
@@ -161,4 +187,25 @@ func splitList(s string) []string {
 		if p != "" { out = append(out, p) }
 	}
 	return out
+}
+
+// parsePrivKey accepts base64 or hex encoding of either a 32-byte seed or a 64-byte ed25519 private key.
+func parsePrivKey(s string) (ed25519.PrivateKey, error) {
+	dec, err := base64.StdEncoding.DecodeString(strings.TrimSpace(s))
+	if err != nil {
+		// try hex
+		if db, err2 := hex.DecodeString(strings.TrimSpace(s)); err2 == nil {
+			dec = db
+		} else {
+			return nil, err
+		}
+	}
+	switch len(dec) {
+	case ed25519.SeedSize:
+		return ed25519.NewKeyFromSeed(dec), nil
+	case ed25519.PrivateKeySize:
+		return ed25519.PrivateKey(dec), nil
+	default:
+		return nil, fmt.Errorf("unexpected ed25519 key length: %d", len(dec))
+	}
 }
