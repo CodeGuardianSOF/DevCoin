@@ -14,11 +14,12 @@ use axum::{
     routing::{get, post},
 };
 use base64::Engine as _;
-use ed25519_dalek::{PublicKey as Ed25519PublicKey, Signature as Ed25519Signature, Verifier};
+use ed25519_dalek::{Signature as Ed25519Signature, Verifier, VerifyingKey as Ed25519PublicKey};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use std::convert::TryInto;
 use thiserror::Error;
 use tokio::{net::TcpListener, sync::RwLock};
 use tracing::{Level, info};
@@ -380,7 +381,8 @@ async fn mint(
         let msg = format!("mint|{}|{}|{}|{}", req.proposer, req.to, req.amount, nonce);
         match b64_decode(sig_b64)
             .ok()
-            .and_then(|b| Ed25519Signature::from_bytes(&b).ok())
+            .and_then(|b| (<[u8; 64]>::try_from(b)).ok())
+            .map(|arr| Ed25519Signature::from_bytes(&arr))
             .and_then(|sig| key.verify(msg.as_bytes(), &sig).ok())
         {
             Some(()) => {
@@ -403,7 +405,8 @@ async fn mint(
         let msg = format!("mint|{}|{}|{}|{}", req.proposer, req.to, req.amount, nonce);
         if b64_decode(sig_b64)
             .ok()
-            .and_then(|b| Ed25519Signature::from_bytes(&b).ok())
+            .and_then(|b| (<[u8; 64]>::try_from(b)).ok())
+            .map(|arr| Ed25519Signature::from_bytes(&arr))
             .and_then(|sig| key.verify(msg.as_bytes(), &sig).ok())
             .is_some()
         {
@@ -457,7 +460,8 @@ async fn transfer(
         );
         match b64_decode(sig_b64)
             .ok()
-            .and_then(|b| Ed25519Signature::from_bytes(&b).ok())
+            .and_then(|b| (<[u8; 64]>::try_from(b)).ok())
+            .map(|arr| Ed25519Signature::from_bytes(&arr))
             .and_then(|sig| key.verify(msg.as_bytes(), &sig).ok())
         {
             Some(()) => {
@@ -483,7 +487,8 @@ async fn transfer(
         );
         if b64_decode(sig_b64)
             .ok()
-            .and_then(|b| Ed25519Signature::from_bytes(&b).ok())
+            .and_then(|b| (<[u8; 64]>::try_from(b)).ok())
+            .map(|arr| Ed25519Signature::from_bytes(&arr))
             .and_then(|sig| key.verify(msg.as_bytes(), &sig).ok())
             .is_some()
         {
@@ -638,13 +643,13 @@ fn parse_pubkey(s: &str) -> Option<Ed25519PublicKey> {
         if b.len() != 32 {
             tracing::warn!(len = b.len(), "decoded base64 pubkey has unexpected length");
         }
-        return Ed25519PublicKey::from_bytes(&b).ok();
+        return Ed25519PublicKey::from_bytes(&b.try_into().ok()?).ok();
     }
     if let Ok(b) = hex::decode(s) {
         if b.len() != 32 {
             tracing::warn!(len = b.len(), "decoded hex pubkey has unexpected length");
         }
-        return Ed25519PublicKey::from_bytes(&b).ok();
+        return Ed25519PublicKey::from_bytes(&b.try_into().ok()?).ok();
     }
     None
 }

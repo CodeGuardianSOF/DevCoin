@@ -1,0 +1,152 @@
+name: Integration
+
+on:
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: integration-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  integration:
+    name: Build & Integration Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src/blockchain-node/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('src/blockchain-node/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build & test (Rust)
+        working-directory: src/blockchain-node
+        run: |
+          cargo build --locked
+          cargo test --all --locked --no-fail-fast
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: contrib-oracle/go.mod
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('contrib-oracle/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Build & test (Go)
+        working-directory: contrib-oracle
+        run: |
+          go mod download
+          go build ./...
+          go test ./...
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install deps & build (frontend)
+        working-directory: frontend
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci --no-audit --no-fund
+          else
+            npm install --no-audit --no-fund
+          fi
+          npm run build --if-present
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Start Rust node (background)
+        env:
+          DEVCOIN_AUTHORITIES: authority1
+          DEVCOIN_ADDR: 127.0.0.1:8080
+          DEVCOIN_DATA_DIR: ${{ runner.temp }}/devcoin-data
+        run: |
+          mkdir -p "$DEVCOIN_DATA_DIR"
+          nohup bash -lc "cargo run --manifest-path src/blockchain-node/Cargo.toml" > server.log 2>&1 &
+          echo $! > node.pid
+          sleep 1
+
+      - name: Wait for health
+        run: |
+          for i in {1..60}; do
+            if curl -fsS http://127.0.0.1:8080/health >/dev/null; then
+              echo "Node healthy"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Node failed to become healthy in time" >&2
+          echo "--- server.log (tail) ---"
+          tail -n 200 server.log || true
+          exit 1
+
+      - name: Integration checks
+        run: |
+          set -euo pipefail
+          echo "Mint 100 to alice"
+          curl -fsS -X POST http://127.0.0.1:8080/mint \
+            -H 'Content-Type: application/json' \
+            -d '{"proposer":"authority1","to":"alice","amount":100}' | tee /dev/stderr
+
+          echo "Verify alice balance == 100"
+          balAlice=$(curl -fsS http://127.0.0.1:8080/balance/alice | jq -r '.balance')
+          test "$balAlice" -eq 100
+
+          echo "Transfer 40 from alice to bob"
+          curl -fsS -X POST http://127.0.0.1:8080/transfer \
+            -H 'Content-Type: application/json' \
+            -d '{"proposer":"authority1","from":"alice","to":"bob","amount":40}' | tee /dev/stderr
+
+          echo "Verify balances: alice=60, bob=40"
+          balAlice2=$(curl -fsS http://127.0.0.1:8080/balance/alice | jq -r '.balance')
+          balBob=$(curl -fsS http://127.0.0.1:8080/balance/bob | jq -r '.balance')
+          test "$balAlice2" -eq 60
+          test "$balBob" -eq 40
+
+      - name: Upload node artifacts (snapshot)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: devcoin-artifacts
+          path: |
+            server.log
+            ${{ runner.temp }}/devcoin-data/**
+
+      - name: Stop Rust node
+        if: always()
+        run: |
+          if [ -f node.pid ]; then kill $(cat node.pid) || true; fi
