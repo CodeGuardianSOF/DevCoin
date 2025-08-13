@@ -535,13 +535,13 @@ fn load_authorities() -> HashSet<String> {
     // Prefer file if provided
     let file_path = env::var("DEVCOIN_AUTHORITIES_FILE").ok();
     let mut set: HashSet<String> = HashSet::new();
-    if let Some(fp) = file_path {
-        if let Ok(data) = fs::read_to_string(fp) {
-            for line in data.lines() {
-                let v = line.trim();
-                if !v.is_empty() {
-                    set.insert(v.to_string());
-                }
+    if let Some(fp) = file_path
+        && let Ok(data) = fs::read_to_string(fp)
+    {
+        for line in data.lines() {
+            let v = line.trim();
+            if !v.is_empty() {
+                set.insert(v.to_string());
             }
         }
     }
