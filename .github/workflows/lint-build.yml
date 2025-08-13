@@ -1,0 +1,101 @@
+name: Lint & Build Check
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lint-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust (blockchain-node)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: src/blockchain-node
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+      - name: Ensure rustfmt & clippy
+        run: |
+          rustup component add rustfmt clippy
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            src/blockchain-node -> target
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Build
+        run: cargo build --locked --all-targets
+
+  go:
+    name: Go (contrib-oracle)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: src/contrib-oracle
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: src/contrib-oracle/go.mod
+          cache: true
+      - name: gofmt check
+        shell: bash
+        run: |
+          CHANGED=$(gofmt -s -l .)
+          if [ -n "$CHANGED" ]; then
+            echo "The following files are not gofmt'ed:" >&2
+            echo "$CHANGED" >&2
+            echo "Run: gofmt -s -w ." >&2
+            exit 1
+          fi
+      - name: go vet
+        run: go vet ./...
+      - name: Build
+        run: go build ./...
+
+  frontend:
+    name: Frontend (Vite/React)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: src/frontend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: |
+            src/frontend/package-lock.json
+            src/frontend/pnpm-lock.yaml
+            src/frontend/yarn.lock
+      - name: Install dependencies
+        shell: bash
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci --no-audit --no-fund
+          else
+            npm install --no-audit --no-fund
+          fi
+      - name: Type check (tsc)
+        run: npx tsc --noEmit
+      - name: Build
+        run: npm run build
